@@ -1,0 +1,467 @@
+import numpy as np
+import torch
+from einops import rearrange
+from torch import nn
+from torch.nn import init
+from base_utils import mesh_utils
+from models.layers.mesh_conv import MeshConv
+from models.layers.mesh_pool import MeshPool
+from models.layers.mesh_unpool import MeshUnpool
+import torch.nn.functional as F
+from typing import List
+from torch import einsum
+from torch_geometric.nn.conv import SAGEConv
+
+sageconv_kwargs: dict = dict(
+    normalize=True,
+    project=True
+)
+
+
+def init_weights(net, init_type, init_gain):
+    def init_func(m):
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            if init_type == 'normal':
+                init.normal_(m.weight.data, 0.0, init_gain)
+            elif init_type == 'xavier':
+                init.xavier_normal_(m.weight.data, gain=init_gain)
+            elif init_type == 'kaiming':
+                init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+            elif init_type == 'orthogonal':
+                init.orthogonal_(m.weight.data, gain=init_gain)
+            else:
+                raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
+        elif classname.find('BatchNorm2d') != -1:
+            init.normal_(m.weight.data, 1.0, init_gain)
+            init.constant_(m.bias.data, 0.0)
+
+    net.apply(init_func)
+
+
+def weight_init(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.xavier_normal_(m.weight)
+        nn.init.constant_(m.bias, 0)
+
+
+def reset_params(model):
+    for i, m in enumerate(model.modules()):
+        weight_init(m)
+
+
+def get_scheduler(iters, optim):
+    lr_lambda = lambda x: 1 - min((0.1 * x / float(iters), 0.95))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
+    return scheduler
+
+
+class PriorNet(nn.Module):
+    """
+    network for
+    """
+
+    def __init__(self, n_edges, in_ch=6, convs=[32, 64], pool=[], res_blocks=0,
+                 init_verts=None, transfer_data=False, leaky=0, init_weights_size=0.002):
+        super(PriorNet, self).__init__()
+        # check that the number of pools and convs match such that there is a pool between each conv
+        down_convs = [in_ch] + convs
+        up_convs = convs[::-1] + [in_ch]
+        pool_res = [n_edges] + pool
+        self.encoder_decoder = MeshEncoderDecoder(pools=pool_res, down_convs=down_convs,
+                                                  up_convs=up_convs, blocks=res_blocks,
+                                                  transfer_data=transfer_data, leaky=leaky)
+        self.last_conv = MeshConv(6, 6)
+        init_weights(self, 'normal', init_weights_size)
+        eps = 1e-8
+        self.last_conv.conv.weight.data.uniform_(-1 * eps, eps)
+        self.last_conv.conv.bias.data.uniform_(-1 * eps, eps)
+        self.init_verts = init_verts
+
+    def forward(self, x, meshes):
+        meshes_new = [i.deep_copy() for i in meshes]
+        x, _ = self.encoder_decoder(x, meshes_new)
+        x = x.squeeze(-1)
+        x = self.last_conv(x, meshes_new).squeeze(-1)
+        est_verts = mesh_utils.build_v(x.unsqueeze(0), meshes)
+        # assert not torch.isnan(est_verts).any()
+        return est_verts.float() + self.init_verts.expand_as(est_verts).to(est_verts.device)
+
+
+class PartNet(PriorNet):
+    def __init__(self, init_part_mesh, in_ch=6, convs=[32, 64], pool=[], res_blocks=0,
+                 init_verts=None, transfer_data=False, leaky=0,
+                 init_weights_size=0.002):
+        temp = torch.linspace(len(convs), 1, len(convs)).long().tolist()
+        super().__init__(temp[0], in_ch=in_ch, convs=convs, pool=temp[1:], res_blocks=res_blocks,
+                         init_verts=init_verts, transfer_data=transfer_data, leaky=leaky,
+                         init_weights_size=init_weights_size)
+        self.mesh_pools = []
+        self.mesh_unpools = []
+        self.factor_pools = pool
+        for i in self.modules():
+            if isinstance(i, MeshPool):
+                self.mesh_pools.append(i)
+            if isinstance(i, MeshUnpool):
+                self.mesh_unpools.append(i)
+        self.mesh_pools = sorted(self.mesh_pools, key=lambda x: x._MeshPool__out_target, reverse=True)
+        self.mesh_unpools = sorted(self.mesh_unpools, key=lambda x: x.unroll_target, reverse=False)
+        self.init_part_verts = nn.ParameterList([torch.nn.Parameter(i) for i in init_part_mesh.init_verts])
+        for i in self.init_part_verts:
+            i.requires_grad = False
+
+    def __set_pools(self, n_edges: int, new_pools: List[int]):
+        for i, l in enumerate(self.mesh_pools):
+            l._MeshPool__out_target = new_pools[i]
+        new_pools = [n_edges] + new_pools
+        new_pools = new_pools[:-1]
+        new_pools.reverse()
+        for i, l in enumerate(self.mesh_unpools):
+            l.unroll_target = new_pools[i]
+
+    def forward(self, x, partmesh):
+        """
+        forward PartNet
+        :param x: BXfXn_edges
+        :param partmesh:
+        :return:
+        """
+
+        for i, p in enumerate(partmesh):
+            n_edges = p.edges_count
+            self.init_verts = self.init_part_verts[i]
+            temp_pools = [int(n_edges - i) for i in self.make3(PartNet.array_times(n_edges, self.factor_pools))]
+            self.__set_pools(n_edges, temp_pools)
+            relevant_edges = x[:, :, partmesh.sub_mesh_edge_index[i]]
+            results = super().forward(relevant_edges, [p])
+            yield results
+
+    @staticmethod
+    def array_times(num: int, iterable):
+        return [i * num for i in iterable]
+
+    @staticmethod
+    def make3(array):
+        diff = [i % 3 for i in array]
+        return [array[i] - diff[i] for i in range(len(array))]
+
+
+class MeshEncoderDecoder(nn.Module):
+    """(Attn) Network for fully-convolutional tasks (feature learning, segmentation, etc.)
+    """
+
+    def __init__(self, pools, down_convs, up_convs, blocks=0, transfer_data=True, leaky=0, attn=True):
+        super(MeshEncoderDecoder, self).__init__()
+        self.transfer_data = transfer_data
+        self.attn = attn
+        self.encoder = MeshEncoder(pools, down_convs, blocks=blocks, leaky=leaky)
+        unrolls = pools[:-1].copy()
+        unrolls.reverse()
+        if self.attn:
+            self.attn1 = FastAttnModule(down_convs[1])
+            self.attn2 = FastAttnModule(down_convs[2])
+            self.attn3 = FastAttnModule(down_convs[3])
+            self.attn4 = FastAttnModule(down_convs[4])
+            self.attn5 = FastAttnModule(down_convs[5])
+        self.decoder = MeshDecoder(unrolls, up_convs, blocks=blocks, transfer_data=transfer_data, leaky=leaky)
+        self.bn = nn.InstanceNorm2d(up_convs[-1])
+
+    def forward(self, x, meshes):
+        fe, before_pool, fe_outs = self.encoder((x, meshes))  # implies "fe_outs" is a list of "fe" from each layer
+        # mid_mesh = meshes[0].deep_copy()
+        if self.attn:
+            # print("oh! I am on it!")
+            # apply FastAttnModule to fe_outs
+            fe_outs[0] = self.attn1(fe_outs[0], meshes)
+            fe_outs[1] = self.attn2(fe_outs[1], meshes)
+            fe_outs[2] = self.attn3(fe_outs[2], meshes)
+            fe_outs[3] = self.attn4(fe_outs[3], meshes)
+            fe_outs[4] = self.attn5(fe_outs[4], meshes)
+        fe = self.decoder((fe_outs[4], meshes), before_pool, fe_outs)
+        fe = self.bn(fe.unsqueeze(-1))
+        return fe, None
+
+
+class MeshEncoder(nn.Module):
+    def __init__(self, pools, convs, blocks=0, leaky=0):
+        super(MeshEncoder, self).__init__()
+        self.leaky = leaky
+        self.convs = []
+
+        for i in range(len(convs) - 1):
+            if i + 1 < len(pools):
+                pool = pools[i + 1]
+            else:
+                pool = 0
+            self.convs.append(DownConv(convs[i], convs[i + 1], blocks=blocks, pool=pool, leaky=leaky))
+        self.convs = nn.ModuleList(self.convs)
+        reset_params(self)
+
+    def forward(self, x):
+        fe, meshes = x
+        encoder_outs = []
+        fe_outs = []
+        for conv in self.convs:
+            fe, before_pool = conv((fe, meshes))
+
+            encoder_outs.append(before_pool)
+            fe_outs.append(fe)  # same as before_pool but with zero pooling
+        return fe, encoder_outs, fe_outs
+
+
+class DownConv(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=0, pool=0, leaky=0, attn=True):
+        super(DownConv, self).__init__()
+        self.leaky = leaky
+        self.bn = []
+        self.pool = None
+        self.conv1 = ConvBlock(in_channels, out_channels)
+        self.conv2 = []
+        for _ in range(blocks):
+            self.conv2.append(ConvBlock(out_channels, out_channels))
+            self.conv2 = nn.ModuleList(self.conv2)
+        for _ in range(blocks + 1):
+            self.bn.append(nn.InstanceNorm2d(out_channels))
+            self.bn = nn.ModuleList(self.bn)
+        if pool:
+            self.pool = MeshPool(pool)
+
+        self.attn_h = nn.MultiheadAttention(embed_dim=out_channels, num_heads=4, batch_first=True)
+        self.attn_w = nn.MultiheadAttention(embed_dim=out_channels, num_heads=4, batch_first=True)
+        self.attn = attn
+
+    def forward(self, x):
+        fe, meshes = x[0], x[1]
+        x1 = self.conv1(fe, meshes)
+        x1 = F.leaky_relu(x1, self.leaky)
+        if self.bn:
+            x1 = self.bn[0](x1)
+        x2 = x1
+        for idx, conv in enumerate(self.conv2):
+            x2 = conv(x1, meshes)
+            x2 = F.leaky_relu(x2, self.leaky)
+            if self.bn:
+                x2 = self.bn[idx + 1](x2)
+            x2 = x2 + x1
+            x1 = x2
+        x2 = x2.squeeze(3)
+        before_pool = None
+        if self.pool:
+            before_pool = x2
+            x2 = self.pool(x2, meshes)
+        # if self.attn: #TODO:
+        #     before_pool = x2
+        B, H, W = x2.shape
+
+        # 处理 H 维度
+        x_h = x2.permute(0, 2, 1)
+        x_h, _ = self.attn_h(x_h, x_h, x_h)  # [B*W, H, C]
+        x_h = x_h.permute(0, 2, 1)
+        if self.pool:
+            x_h = self.pool(x_h, meshes)
+        # 合并 H 和 W 的 Attention 结果
+        x2 = x_h
+        return x2, before_pool
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_feat, out_feat, k=1):
+        super(ConvBlock, self).__init__()
+        self.lst = [MeshConv(in_feat, out_feat)]
+        for i in range(k - 1):
+            self.lst.append(MeshConv(out_feat, out_feat))
+        self.lst = nn.ModuleList(self.lst)
+
+    def forward(self, input, meshes):
+        for c in self.lst:
+            input = c(input, meshes)
+        return input
+
+
+class MeshDecoder(nn.Module):  # unroll is unpool
+    def __init__(self, unrolls, convs, blocks=0, batch_norm=True, transfer_data=True, leaky=0):
+        super(MeshDecoder, self).__init__()
+        self.up_convs = []
+        for i in range(len(convs) - 2):
+            if i < len(unrolls):
+                unroll = unrolls[i]
+            else:
+                unroll = 0
+            self.up_convs.append(UpConv(convs[i], convs[i + 1], blocks=blocks, unroll=unroll,
+                                        batch_norm=batch_norm, transfer_data=transfer_data, leaky=leaky))
+        self.final_conv = UpConv(convs[-2], convs[-1], blocks=blocks, unroll=False,
+                                 batch_norm=batch_norm, transfer_data=False, leaky=leaky)
+        self.up_convs = nn.ModuleList(self.up_convs)
+        reset_params(self)
+
+    def forward(self, x, encoder_outs=None, attn_outs=None):
+        fe, meshes = x
+        for i, up_conv in enumerate(self.up_convs):
+            before_pool = None
+            if encoder_outs is not None:
+                before_pool = encoder_outs[-(i + 2)]
+            if i > 0 and attn_outs is not None:
+                fe = fe + attn_outs[-(i + 1)]
+            fe = up_conv((fe, meshes), before_pool)
+        fe = self.final_conv((fe, meshes))
+        return fe
+
+    def __call__(self, x, encoder_outs=None, attn_outs=None):
+        return self.forward(x, encoder_outs, attn_outs)
+
+
+class UpConv(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=0, unroll=0, residual=True,
+                 batch_norm=True, transfer_data=True, leaky=0):
+        super(UpConv, self).__init__()
+        self.leaky = leaky
+        self.residual = residual
+        self.bn = []
+        self.unroll = None
+        self.transfer_data = transfer_data
+        self.up_conv = ConvBlock(in_channels, out_channels)
+        if transfer_data:
+            self.conv1 = ConvBlock(2 * out_channels, out_channels)
+        else:
+            self.conv1 = ConvBlock(out_channels, out_channels)
+        self.conv2 = []
+        for _ in range(blocks):
+            self.conv2.append(ConvBlock(out_channels, out_channels))
+            self.conv2 = nn.ModuleList(self.conv2)
+        if batch_norm:
+            for _ in range(blocks + 1):
+                self.bn.append(nn.InstanceNorm2d(out_channels))
+            self.bn = nn.ModuleList(self.bn)
+        if unroll:
+            self.unroll = MeshUnpool(unroll)
+
+    def forward(self, x, from_down=None):
+        from_up, meshes = x
+        x1 = self.up_conv(from_up, meshes).squeeze(3)
+        if self.unroll:
+            x1 = self.unroll(x1, meshes)
+        if self.transfer_data:
+            # TODO: FA forward goes here as from_down = FA(from_down)
+            x1 = torch.cat((x1, from_down), 1)
+        x1 = self.conv1(x1, meshes)
+        x1 = F.leaky_relu(x1, self.leaky)
+        if self.bn:
+            x1 = self.bn[0](x1)
+
+        x2 = x1
+        for idx, conv in enumerate(self.conv2):
+            x2 = conv(x1, meshes)
+            x2 = F.leaky_relu(x2, self.leaky)
+            if self.bn:
+                x2 = self.bn[idx + 1](x2)
+            if self.residual:
+                x2 = x2 + x1
+            x1 = x2
+        x2 = x2.squeeze(3)
+        return x2
+
+
+# -------------------------------------------------
+# --------------------- FANet ---------------------
+# -------------------------------------------------
+class BatchNorm2d(nn.BatchNorm2d):  # TODO: BN to instance norm
+    '''(conv => BN => ReLU) * 2'''
+
+    def __init__(self, num_features, activation='none'):
+        super(BatchNorm2d, self).__init__(num_features=num_features)
+        if activation == 'leaky_relu':
+            self.activation = nn.LeakyReLU()
+        elif activation == 'none':
+            self.activation = lambda x: x
+        else:
+            raise Exception("Accepted activation: ['leaky_relu']")
+
+    def forward(self, x):
+        return self.activation(x)
+
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_feat, out_feat, act='gelu', ln=True):
+        super(ConvBNReLU, self).__init__()
+        self.ln = ln
+        self.act = act
+        self.conv = MeshConv(in_feat, out_feat)
+        if self.ln:
+            self.bn = nn.InstanceNorm2d(out_feat)
+
+        # self.formerlayer = nn.TransformerEncoderLayer(out_feat,4)
+        # self.former = nn.TransformerEncoder(self.formerlayer,4)
+
+    def forward(self, x, meshes):
+        x = self.conv(x, meshes)  # meshconv takes two inputs, x and mesh
+        B, C, H, W = x.shape
+        # x1 = x.view(B, C, -1).permute(0, 2, 1)
+        # x1 = self.former(x1)
+        # x = x1.view(B, C, H, W)
+        if self.ln:
+            x = self.bn(x)
+        if self.act == 'gelu':
+            x = F.gelu(x)
+        return x
+
+
+##TODO:define flash atten
+
+##
+class FastAttnModule(nn.Module):
+    def __init__(self, in_feat):
+        super(FastAttnModule, self).__init__()
+
+        self.w_qs = ConvBNReLU(in_feat, 256, act='none', ln=True)
+        self.w_ks = ConvBNReLU(in_feat, 256, act='none', ln=True)
+        self.w_vs = ConvBNReLU(in_feat, in_feat, act='gelu', ln=True)
+        self.multihead_attn1 = nn.MultiheadAttention(256, 4, dropout=0.0)
+        self.dropout1 = nn.Dropout(0.0)
+        self.dropout12 = nn.Dropout(0.0)
+        self.dropout13 = nn.Dropout(0.0)
+        self.linear12 = nn.Linear(256, in_feat)
+        self.activation1 = torch.nn.GELU()
+        self.linear11 = nn.Linear(256, 256)
+        self.latlayer3 = ConvBNReLU(in_feat, in_feat, act='gelu', ln=True)
+
+        # self.latlayer3 = ConvBNReLU(in_feat, in_feat, act='gelu', ln=True)
+
+    def forward(self, feat, meshes):
+        query = self.w_qs(feat, meshes)
+        query1 = self.w_qs(feat, meshes)
+        key = self.w_ks(feat, meshes)
+        value = self.w_vs(feat, meshes)
+
+        B, C, H, W = feat.unsqueeze(-1).size()
+
+        query_ = query.view(B, 256, -1).permute(0, 2, 1)
+        query = F.normalize(query_, p=2, dim=2, eps=1e-12)
+
+        query1_ = query1.view(B, 256, -1).permute(0, 2, 1)
+        query1 = F.normalize(query1_, p=2, dim=2, eps=1e-12)
+
+        src12 = self.multihead_attn1(query=query,
+                                     key=query1,
+                                     value=query1)[0]
+
+        src1 = query + self.dropout12(src12)
+        src1 = F.normalize(src1, p=2, dim=2, eps=1e-12)
+
+        src12 = self.linear12(self.dropout1(self.activation1(self.linear11(src1))))
+        src1 = self.linear12(self.dropout1(self.activation1(self.linear11(src1))))
+        src1 = src1 + self.dropout13(src12)
+
+        key_ = key.view(B, 128, -1)
+        key = F.normalize(key_, p=2, dim=1, eps=1e-12)
+
+        value = value.view(B, C, -1).permute(0, 2, 1)
+
+        # = torch.matmul(key, value)
+        # y = torch.matmul(query, f)
+        y = src1.permute(0, 2, 1).contiguous()
+
+        y = y.view(B, C, H, W)
+        W_y = self.latlayer3(y, meshes)
+        p_feat = W_y.squeeze(-1) + feat
+
+        return p_feat
